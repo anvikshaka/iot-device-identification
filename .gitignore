@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data files (too large for GitHub)
+data/raw/*.npy
+data/test/*.npy
+
+# Trained models (too large for GitHub)
+models/*.h5
+models/*.keras
+
+# Keep reports/plots in models/ but not the binaries
+# models/metadata.json          -- tracked
+# models/classification_report  -- tracked
+# models/*.png                  -- tracked
+
+# Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Results (optional: uncomment to exclude)
+# results/
+
+# pytest
+.pytest_cache/

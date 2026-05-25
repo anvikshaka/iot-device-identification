@@ -1,0 +1,7 @@
+file,true_label,predicted_label,confidence,windows,correct
+data/test/dooralarm_test.npy,dooralarm,dooralarm,0.84740227,9762,1
+data/test/lora_test.npy,lora,lora,0.96165287,9762,1
+data/test/microphone_test.npy,microphone,microphone,0.99999988,9762,1
+data/test/mbus_test.npy,mbus,mbus,0.92753309,9762,1
+data/test/sigfox_test.npy,sigfox,sigfox,0.97384238,9762,1
+data/test/miwi_test.npy,miwi,miwi,0.87450963,9762,1

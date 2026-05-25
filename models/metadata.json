@@ -1,0 +1,18 @@
+{
+  "classes": [
+    "dooralarm",
+    "lora",
+    "microphone",
+    "mbus",
+    "sigfox",
+    "miwi"
+  ],
+  "test_loss": 0.19829830527305603,
+  "test_accuracy": 0.9453924894332886,
+  "input_shape": [
+    257,
+    61,
+    1
+  ],
+  "balanced": true
+}
