@@ -7,7 +7,7 @@ The current executable pipeline is organized around these modules:
 | Module | Responsibility |
 | --- | --- |
 | `src/config.py` | Class order, default hyperparameters, and spectrogram configuration |
-| `src/dataset.py` | Locate labeled signal files, segment, preprocess, balance, shuffle, and split data |
+| `src/dataset.py` | Load recording manifests or legacy files, preserve split assignments, preprocess, balance, and shuffle |
 | `src/preprocessing.py` | Windowing, per-window normalization, and spectrogram conversion |
 | `src/model.py` | Define and compile the Keras CNN |
 | `src/train.py` | Train, checkpoint, evaluate the held-out split, and write model artifacts |
@@ -26,28 +26,33 @@ legacy utilities and are not used by the executable pipeline.
 
 ![RF classification data and execution flow](flowchart.png)
 
-1. `dataset.build_dataset()` loads each class's one-dimensional `float32`
-   signal from `data/raw/<class>.npy`.
-2. The signal is divided into non-overlapping `4096`-sample windows.
+1. A CSV manifest maps each independent recording to a class, scenario,
+   capture identifier, and `train`, `validation`, or `test` split.
+2. `train.py` loads each split independently, then divides its recordings
+   into non-overlapping `4096`-sample windows.
 3. Each window is standardized independently and converted to a log-compressed
    SciPy spectrogram using the configuration in `config.py`.
 4. When balancing is enabled, each class is truncated to the lowest available
-   number of windows; examples are then shuffled.
-5. `split_dataset()` creates stratified 80% train, 10% validation, and 10%
-   held-out test window splits.
+   number of windows within its assigned split; an optional cap samples raw
+   windows before memory-intensive spectrogram conversion.
+5. Complete recordings are assigned before window creation, preventing
+   capture windows from crossing between fitting and held-out evaluation.
 6. `train.py` trains the CNN and writes model/report artifacts to `models/`.
+
+The legacy `--data-dir data/raw` mode still uses a stratified random window
+split for compatibility; it is not recommended for scenario generalization.
 
 ## Inference Flow
 
 Single-file and external testing use `infer.predict_signal()`:
 
-1. Load a raw `.npy` signal.
+1. Load raw `.npy` signals from a selected manifest split or legacy directory.
 2. Form overlapping `4096`-sample windows using a default step of `1024`.
 3. Apply the same normalization and spectrogram transformation used during
    training.
 4. Predict six probabilities for every window.
-5. Average probabilities across all windows and select the highest averaged
-   probability as the file prediction.
+5. Average probabilities across all windows and select one file prediction.
+6. For manifest-based testing, report file-level outcomes grouped by scenario.
 
 ## CNN Architecture
 

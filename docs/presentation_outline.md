@@ -8,7 +8,8 @@
 
 ## 2. Dataset and Evaluation Units
 
-- Raw and external test inputs are one-dimensional `.npy` RF recordings.
+- Multiple independent `.npy` RF recordings are assigned through a manifest
+  containing class, scenario, capture ID, and split.
 - Local reviewed files contain 10,000,000 samples each.
 - Clarify the difference between window-level and file-level evaluation before
   showing any accuracy value.
@@ -18,7 +19,8 @@
 - Show `docs/flowchart.png`.
 - Highlight the shared normalization/spectrogram path used for training and
   inference.
-- Contrast non-overlapping training windows with overlapping inference windows.
+- Explain that complete recordings are assigned to a split before windowing,
+  preventing leakage across scenario tests.
 
 ## 4. Feature Representation
 
@@ -35,7 +37,7 @@
 
 ## 6. Training Protocol
 
-- Balanced classes and stratified 80/10/10 window split.
+- Balanced classes within explicit recording-level train/validation/test splits.
 - Adam optimizer, categorical cross-entropy, up to 15 epochs.
 - Early stopping, learning-rate reduction, and best-validation checkpointing.
 
@@ -64,5 +66,6 @@
 
 ## 10. Next Engineering Steps
 
-- Add recording-level evaluation sets and report robust external metrics.
+- Populate the recording manifest with multiple independent captures per
+  device/scenario and report robust external metrics.
 - Pin and automate the validated training/evaluation environment.

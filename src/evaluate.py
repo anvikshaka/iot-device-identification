@@ -27,11 +27,21 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=Path("models/best_iot_classifier.h5"))
     parser.add_argument("--metadata", type=Path, default=Path("models/metadata.json"))
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--data-dir",
         type=Path,
-        required=True,
         help="Directory of labeled signals to score; specify this explicitly to avoid confusing training-source and external metrics.",
+    )
+    source.add_argument(
+        "--manifest",
+        type=Path,
+        help="CSV manifest containing one or more labeled recordings.",
+    )
+    parser.add_argument(
+        "--manifest-split",
+        default="test",
+        help="Manifest split to evaluate when --manifest is used (default: test).",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("results/evaluation"))
     parser.add_argument(
@@ -43,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--window-size", type=int, default=WINDOW_SIZE)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--max-windows-per-class",
+        type=int,
+        default=None,
+        help="Optionally sample at most this many windows per class before spectrogram conversion.",
+    )
     parser.add_argument(
         "--file-template",
         help="Optional file pattern such as '{class_name}_test.npy'. Defaults to auto-detecting raw and test names.",
@@ -87,7 +103,7 @@ def write_predictions_csv(
 def run_evaluation(
     model_path: Path,
     metadata_path: Path,
-    data_dir: Path,
+    data_dir: Path | None,
     output_dir: Path,
     batch_size: int = BATCH_SIZE,
     window_size: int = WINDOW_SIZE,
@@ -96,6 +112,9 @@ def run_evaluation(
     balance: bool = False,
     allow_missing: bool = False,
     evaluation_role: str | None = None,
+    manifest_path: Path | None = None,
+    manifest_split: str = "test",
+    max_windows_per_class: int | None = None,
 ) -> dict[str, object]:
     """Evaluate model performance on labeled files and save reports."""
     if evaluation_role not in EVALUATION_ROLES:
@@ -113,6 +132,9 @@ def run_evaluation(
         seed=seed,
         file_template=file_template,
         allow_missing=allow_missing,
+        manifest_path=manifest_path,
+        split=manifest_split if manifest_path else None,
+        max_windows_per_class=max_windows_per_class,
     )
 
     model = tf.keras.models.load_model(str(model_path))
@@ -146,7 +168,9 @@ def run_evaluation(
     metrics = {
         "evaluation_role": evaluation_role,
         "evaluation_unit": "non_overlapping_window",
-        "data_dir": str(data_dir),
+        "data_dir": str(data_dir) if data_dir else None,
+        "manifest": str(manifest_path) if manifest_path else None,
+        "manifest_split": manifest_split if manifest_path else None,
         "model": str(model_path),
         "samples": int(len(y)),
         "loss": float(loss),
@@ -155,13 +179,15 @@ def run_evaluation(
             classes[label]: count for label, count in class_distribution(y).items()
         },
         "balanced": bool(balance),
+        "max_windows_per_class": max_windows_per_class,
     }
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2),
         encoding="utf-8",
     )
 
-    print(f"Evaluated {len(y)} windows from {data_dir}")
+    source = f"{manifest_path} split={manifest_split}" if manifest_path else str(data_dir)
+    print(f"Evaluated {len(y)} windows from {source}")
     print(f"Evaluation role: {evaluation_role}")
     print(f"Accuracy: {accuracy:.4f}")
     print(report)
@@ -184,6 +210,9 @@ def main() -> None:
         balance=args.balance,
         allow_missing=args.allow_missing,
         evaluation_role=args.evaluation_role,
+        manifest_path=args.manifest,
+        manifest_split=args.manifest_split,
+        max_windows_per_class=args.max_windows_per_class,
     )
 
 

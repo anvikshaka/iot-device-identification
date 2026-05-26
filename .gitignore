@@ -6,6 +6,7 @@ __pycache__/
 # Data files (too large for GitHub)
 data/raw/*.npy
 data/test/*.npy
+data/recordings/**/*.npy
 
 # Trained models (too large for GitHub)
 models/*.h5
@@ -33,7 +34,7 @@ venv.bak/
 Thumbs.db
 
 # Results (optional: uncomment to exclude)
-# results/
+results/
 
 # pytest
 .pytest_cache/

@@ -7,15 +7,55 @@
     "sigfox",
     "miwi"
   ],
-  "test_evaluation_role": "random-window-holdout-from-training-source-recordings",
+  "split_strategy": "recording_manifest",
+  "source": {
+    "manifest": "data/recordings_manifest.csv",
+    "recordings_by_split": {
+      "test": 12,
+      "train": 6,
+      "validation": 6
+    },
+    "recordings_by_scenario": {
+      "anotherroom": 12,
+      "upstairs": 12
+    },
+    "classes_by_split": {
+      "test": [
+        "dooralarm",
+        "lora",
+        "mbus",
+        "microphone",
+        "miwi",
+        "sigfox"
+      ],
+      "train": [
+        "dooralarm",
+        "lora",
+        "mbus",
+        "microphone",
+        "miwi",
+        "sigfox"
+      ],
+      "validation": [
+        "dooralarm",
+        "lora",
+        "mbus",
+        "microphone",
+        "miwi",
+        "sigfox"
+      ]
+    }
+  },
+  "test_evaluation_role": "held-out-recordings-from-manifest",
   "test_evaluation_unit": "non_overlapping_window",
-  "test_samples": 1465,
-  "test_loss": 0.19829830527305603,
-  "test_accuracy": 0.9453924894332886,
+  "test_samples": 3000,
+  "test_loss": 1.7703731060028076,
+  "test_accuracy": 0.6330000162124634,
   "input_shape": [
     257,
     61,
     1
   ],
-  "balanced": true
+  "balanced": true,
+  "max_windows_per_class": 500
 }

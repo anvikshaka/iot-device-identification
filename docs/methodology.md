@@ -9,14 +9,22 @@ probability output.
 
 ## Input Data
 
-The code expects one NumPy array per class. The local dataset reviewed for this
+The recommended workflow accepts multiple independent NumPy recordings per
+class through a CSV manifest. The local legacy dataset reviewed for this
 documentation contains `10,000,000` `float32` samples in each raw and external
 test file.
 
 | Purpose | File pattern | Treatment |
 | --- | --- | --- |
-| Training source | `data/raw/<class>.npy` | Non-overlapping windows used to construct train/validation/held-out test subsets |
-| External test source | `data/test/<class>_test.npy` | Whole-file prediction using overlapping inference windows |
+| Multi-recording training/evaluation | Manifest row: `path,class,scenario,capture_id,split` | Complete capture assigned to train, validation, or test before segmentation |
+| Legacy training source | `data/raw/<class>.npy` | Non-overlapping windows randomly partitioned; compatibility mode only |
+| Legacy external test source | `data/test/<class>_test.npy` | Whole-file prediction using overlapping inference windows |
+
+Manifest validation rejects a signal file listed more than once, so the same
+capture cannot accidentally appear in two experimental splits.
+Training and validation require recordings for all configured classes. The
+test split may contain only a targeted held-out device/scenario, such as
+microphone recordings from a new room.
 
 With `WINDOW_SIZE = 4096`, each local raw file supplies `2441` complete
 training windows; remaining trailing samples are discarded. The balanced
@@ -51,7 +59,7 @@ The CNN consists of four convolutional feature-extraction blocks followed by a
 fully connected classification head. Detailed layer shapes appear in
 [architecture.md](architecture.md).
 
-Default training configuration:
+Default model configuration:
 
 | Setting | Value |
 | --- | --- |
@@ -62,8 +70,10 @@ Default training configuration:
 | Learning rate | `3e-4` |
 | Optimizer | Adam |
 | Loss | Categorical cross-entropy |
-| Split | Stratified 80% train / 10% validation / 10% held-out test windows |
+| Recommended split | Explicit recording-level `train` / `validation` / `test` assignments in a manifest |
+| Legacy split | Stratified 80% train / 10% validation / 10% held-out windows |
 | Balancing | Enabled by default; truncate each class to the minimum class window count |
+| Large multi-capture sets | Use `--max-windows-per-class N` for bounded reservoir sampling per split/class before spectrogram conversion |
 
 Training callbacks:
 
@@ -80,9 +90,11 @@ interchangeable.
 
 | Command/path | Unit measured | Appropriate interpretation |
 | --- | --- | --- |
-| Training held-out report in `models/` | Individual non-overlapping windows held out after random split of `data/raw` windows | Internal test estimate; windows still originate from the same six source recordings as training |
+| `python src/train.py --manifest ...` held-out report | Windows from whole recordings assigned to `test` before segmentation | Internal model-training report without capture leakage |
+| Legacy training held-out report in `models/` | Windows held out after random split of `data/raw` | Historical estimate; windows originate from the same source recordings as training |
 | `python src/evaluate.py --data-dir data/raw --evaluation-role training-source-diagnostic` | Individual windows loaded from `data/raw` | Diagnostic scoring on the training-source recordings, not independent test performance |
-| `python src/test.py --data-dir data/test` output in `results/test/` | One consolidated prediction per external file | External file-level check; currently only six scored files |
+| `python src/test.py --manifest ... --manifest-split test` | One consolidated prediction per held-out file, grouped by scenario | Recommended scenario evaluation |
+| `python src/test.py --data-dir data/test` output in `results/test/` | One consolidated prediction per legacy external file | Historical external check; currently only six scored files |
 
 ## Recorded Results
 
@@ -103,7 +115,27 @@ statistically robust 100% generalization rate.
 ## Reproducible Commands
 
 ```bash
-# Train and generate model-held-out reports.
+# Recommended: train with independent recording assignments.
+python src/train.py \
+  --manifest data/recordings_manifest.csv \
+  --output-dir models \
+  --max-windows-per-class 500
+
+# Recommended: one test prediction per held-out capture and scenario.
+python src/test.py \
+  --manifest data/recordings_manifest.csv \
+  --manifest-split test \
+  --model models/best_iot_classifier.h5 \
+  --metadata models/metadata.json \
+  --output-dir results/scenario_test
+
+# Optional: require the test split to cover all six device classes.
+python src/test.py \
+  --manifest data/recordings_manifest.csv \
+  --manifest-split test \
+  --require-all-classes
+
+# Legacy: train and generate model-held-out window reports.
 python src/train.py --data-dir data/raw --output-dir models
 
 # Diagnose predictions over all labeled raw-source windows.
@@ -122,8 +154,8 @@ python src/predict.py --input data/test/miwi_test.npy
 ## Methodological Limitations
 
 - Randomly splitting windows from each continuous source recording can
-  overestimate performance on new recordings or devices; recording-level
-  splits are preferable when additional captures are available.
+  overestimate performance on new recordings or devices; use the manifest
+  workflow to assign complete recordings before window generation.
 - The raw-directory evaluation reuses training-source files and must not be
   cited as an independent validation metric.
 - The external test report contains six file-level observations, so it is an

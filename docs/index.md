@@ -2,6 +2,8 @@
 
 This documentation describes the implemented RF IoT classification project as
 reviewed from the source code and checked-in result artifacts on 2026-05-25.
+The recommended experiment workflow uses a CSV recording manifest so multiple
+device scenarios can be split and evaluated without capture leakage.
 
 ## Contents
 

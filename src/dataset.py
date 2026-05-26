@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +12,82 @@ from sklearn.utils import shuffle
 
 from config import CLASSES, DATA_FILES, SEED, TEST_DATA_FILES, WINDOW_SIZE
 from preprocessing import segment_signal, windows_to_model_input
+
+
+@dataclass(frozen=True)
+class Recording:
+    """One independently captured signal file and its experimental metadata."""
+
+    path: Path
+    class_name: str
+    scenario: str = "unspecified"
+    capture_id: str = ""
+    split: str | None = None
+
+
+def load_manifest(
+    manifest_path: Path,
+    classes: list[str] | None = None,
+    split: str | None = None,
+) -> list[Recording]:
+    """Load recording assignments from a CSV manifest.
+
+    Paths in the manifest are interpreted relative to the working directory,
+    matching the command-line paths used throughout this project.
+    """
+    classes = classes or CLASSES
+    required_columns = {"path", "class", "scenario", "capture_id", "split"}
+    all_recordings: list[Recording] = []
+
+    with manifest_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        missing = required_columns.difference(reader.fieldnames or [])
+        if missing:
+            missing_text = ", ".join(sorted(missing))
+            raise ValueError(f"Manifest {manifest_path} is missing columns: {missing_text}")
+
+        for row_number, row in enumerate(reader, start=2):
+            class_name = row["class"].strip()
+            if class_name not in classes:
+                raise ValueError(
+                    f"Manifest {manifest_path} row {row_number} has unknown class: {class_name}"
+                )
+
+            row_split = row["split"].strip()
+            path = Path(row["path"].strip())
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"Manifest {manifest_path} row {row_number} references missing file: {path}"
+                )
+            all_recordings.append(
+                Recording(
+                    path=path,
+                    class_name=class_name,
+                    scenario=row["scenario"].strip() or "unspecified",
+                    capture_id=row["capture_id"].strip(),
+                    split=row_split or None,
+                )
+            )
+
+    assigned_paths: dict[Path, str | None] = {}
+    for recording in all_recordings:
+        normalized_path = recording.path.resolve()
+        if normalized_path in assigned_paths:
+            raise ValueError(
+                f"Manifest {manifest_path} assigns recording more than once: {recording.path}"
+            )
+        assigned_paths[normalized_path] = recording.split
+
+    recordings = [
+        recording
+        for recording in all_recordings
+        if split is None or recording.split == split
+    ]
+    if not recordings:
+        requested = f" for split={split}" if split else ""
+        raise ValueError(f"Manifest {manifest_path} contains no recordings{requested}")
+
+    return recordings
 
 
 def class_file_candidates(
@@ -84,6 +162,26 @@ def iter_class_signal_paths(
     return paths
 
 
+def legacy_recordings(
+    data_dir: Path,
+    classes: list[str] | None = None,
+    file_map: dict[str, str] | None = None,
+    file_template: str | None = None,
+    allow_missing: bool = False,
+) -> list[Recording]:
+    """Represent one-file-per-class data directories as recording metadata."""
+    return [
+        Recording(path=path, class_name=class_name)
+        for class_name, path in iter_class_signal_paths(
+            data_dir,
+            classes=classes,
+            file_map=file_map,
+            file_template=file_template,
+            allow_missing=allow_missing,
+        )
+    ]
+
+
 def load_raw_signal(
     data_dir: Path,
     class_name: str,
@@ -101,7 +199,7 @@ def load_raw_signal(
 
 
 def build_dataset(
-    data_dir: Path,
+    data_dir: Path | None = None,
     classes: list[str] | None = None,
     window_size: int = WINDOW_SIZE,
     balance: bool = True,
@@ -109,35 +207,107 @@ def build_dataset(
     file_map: dict[str, str] | None = None,
     file_template: str | None = None,
     allow_missing: bool = False,
+    manifest_path: Path | None = None,
+    split: str | None = None,
+    max_windows_per_class: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Load all class signals, segment them, create spectrograms, and label them."""
+    """Build model inputs from legacy directories or a multi-recording manifest."""
     classes = classes or CLASSES
-    all_specs: list[np.ndarray] = []
-    all_labels: list[np.ndarray] = []
+    if manifest_path is not None:
+        recordings = load_manifest(manifest_path, classes=classes, split=split)
+    elif data_dir is not None:
+        recordings = legacy_recordings(
+            data_dir,
+            classes=classes,
+            file_map=file_map,
+            file_template=file_template,
+            allow_missing=allow_missing,
+        )
+    else:
+        raise ValueError("Provide data_dir or manifest_path")
 
-    for class_name, signal_path in iter_class_signal_paths(
-        data_dir,
+    return build_dataset_from_recordings(
+        recordings,
         classes=classes,
-        file_map=file_map,
-        file_template=file_template,
+        window_size=window_size,
+        balance=balance,
+        seed=seed,
         allow_missing=allow_missing,
-    ):
-        idx = classes.index(class_name)
-        raw = np.load(signal_path)
+        max_windows_per_class=max_windows_per_class,
+    )
+
+
+def build_dataset_from_recordings(
+    recordings: list[Recording],
+    classes: list[str] | None = None,
+    window_size: int = WINDOW_SIZE,
+    balance: bool = True,
+    seed: int = SEED,
+    allow_missing: bool = False,
+    max_windows_per_class: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create window inputs after recordings have already been assigned a split."""
+    classes = classes or CLASSES
+    if max_windows_per_class is not None and max_windows_per_class <= 0:
+        raise ValueError("max_windows_per_class must be positive")
+
+    windows_by_class: dict[str, list[np.ndarray]] = {class_name: [] for class_name in classes}
+    windows_seen: dict[str, int] = {class_name: 0 for class_name in classes}
+    rng = np.random.default_rng(seed)
+
+    for recording in recordings:
+        if recording.class_name not in classes:
+            raise ValueError(f"Unknown recording class: {recording.class_name}")
+        raw = np.load(recording.path)
         windows = segment_signal(raw, window_size=window_size)
         if len(windows) == 0:
             raise ValueError(
-                f"{class_name} has fewer than {window_size} samples and cannot be segmented"
+                f"{recording.path} has fewer than {window_size} samples and cannot be segmented"
             )
+        if max_windows_per_class is None:
+            windows_by_class[recording.class_name].append(windows)
+            continue
 
-        specs = windows_to_model_input(windows)
-        all_specs.append(specs)
-        all_labels.append(np.full(len(specs), idx, dtype=np.int64))
+        samples = windows_by_class[recording.class_name]
+        for window in windows:
+            windows_seen[recording.class_name] += 1
+            seen = windows_seen[recording.class_name]
+            if len(samples) < max_windows_per_class:
+                samples.append(np.array(window, copy=True))
+                continue
+            candidate = int(rng.integers(0, seen))
+            if candidate < max_windows_per_class:
+                samples[candidate] = np.array(window, copy=True)
 
-    if balance:
-        min_samples = min(len(specs) for specs in all_specs)
-        all_specs = [specs[:min_samples] for specs in all_specs]
-        all_labels = [labels[:min_samples] for labels in all_labels]
+    missing = [name for name, windows in windows_by_class.items() if not windows]
+    if missing and not allow_missing:
+        raise ValueError(f"No recordings provided for classes: {', '.join(missing)}")
+
+    class_windows = {
+        class_name: (
+            np.asarray(windows)
+            if max_windows_per_class is not None
+            else np.concatenate(windows, axis=0)
+        )
+        for class_name, windows in windows_by_class.items()
+        if windows
+    }
+    balanced_limit = min(len(windows) for windows in class_windows.values()) if balance else None
+    all_specs: list[np.ndarray] = []
+    all_labels: list[np.ndarray] = []
+    for idx, class_name in enumerate(classes):
+        if class_name not in class_windows:
+            continue
+        windows = class_windows[class_name]
+        limit = balanced_limit if balance else len(windows)
+        if max_windows_per_class is not None:
+            limit = min(limit, max_windows_per_class)
+        if len(windows) > limit:
+            indices = np.sort(rng.choice(len(windows), size=limit, replace=False))
+            windows = windows[indices]
+        class_specs = windows_to_model_input(windows)
+        all_specs.append(class_specs)
+        all_labels.append(np.full(len(class_specs), idx, dtype=np.int64))
 
     x = np.concatenate(all_specs, axis=0)
     y = np.concatenate(all_labels, axis=0)

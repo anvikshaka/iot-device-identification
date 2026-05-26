@@ -17,7 +17,7 @@ therefore a diagnostic measurement on training-source recordings, not an
 external validation score. Reporting it without that distinction would
 overstate model generalization.
 
-**Action:** `evaluate.py` now requires `--data-dir` and
+**Action:** `evaluate.py` now requires `--data-dir` or `--manifest` and
 `--evaluation-role`, whose choices distinguish training-source diagnostics from
 external window evaluation. Metrics include `evaluation_role` and
 `evaluation_unit`. The checked-in raw-directory metric has been marked
@@ -81,12 +81,20 @@ interpretation note. The six-file checked-in result has a wide interval of
 approximately `[0.610, 1.000]`. Gathering more independent captures remains a
 data requirement rather than a code change.
 
+### Resolved: Scenario datasets can be evaluated without capture leakage
+
+**Action:** `dataset.py` now supports a manifest with `path`, `class`,
+`scenario`, `capture_id`, and `split` fields. `train.py --manifest` builds
+training, validation, and held-out datasets after entire recordings have been
+assigned to their split. `test.py --manifest` performs one ensemble prediction
+per held-out recording and reports scenario-level file metrics.
+
 ## Verification Notes
 
 - `pytest` is now listed in `requirements.txt` as a development/test
   requirement.
-- The updated test suite passes with `9` tests covering active
-  model/preprocessing behavior, compatibility imports, and the file-level
-  confidence interval helper.
+- The updated test suite covers active model/preprocessing behavior,
+  compatibility imports, manifest ingestion, class balancing across multiple
+  recordings, and scenario-level file summaries.
 - Diagram placeholders under `docs/` were zero-byte files before the
   documentation update; `docs/generate_diagrams.py` now regenerates them.
