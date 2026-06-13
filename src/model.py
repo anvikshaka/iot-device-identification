@@ -19,9 +19,18 @@ from tensorflow.keras.layers import (
 )
 
 
+@tf.keras.utils.register_keras_serializable(package="iot")
+class StopGradientLayer(tf.keras.layers.Layer):
+    """Pass-through layer that blocks gradient flow."""
+
+    def call(self, inputs):
+        return tf.stop_gradient(inputs)
+
+
 def build_cnn(
     input_shape: tuple[int, int, int],
     num_classes: int,
+    num_locations: int = 3,
     learning_rate: float = 3e-4,
     pooling: str = "avg",
 ) -> tf.keras.Model:
@@ -56,15 +65,29 @@ def build_cnn(
     else:
         x = Concatenate()([GlobalAveragePooling2D()(x), GlobalMaxPooling2D()(x)])
 
-    x = Dense(256, activation="relu")(x)
-    x = Dropout(0.25)(x)
-    outputs = Dense(num_classes, activation="softmax")(x)
+    shared = Dense(256, activation="relu")(x)
+    shared = Dropout(0.25)(shared)
+    device_output = Dense(num_classes, activation="softmax", name="device")(shared)
 
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    # Location branch with StopGradientLayer to protect device accuracy from location gradient corruption
+    loc_input = StopGradientLayer()(x)
+    loc_branch = Dense(128, activation="relu")(loc_input)
+    loc_branch = Dropout(0.3)(loc_branch)
+    loc_branch = Dense(64, activation="relu")(loc_branch)
+    location_output = Dense(num_locations, activation="softmax", name="location")(loc_branch)
+
+    model = tf.keras.Model(inputs=inputs, outputs=[device_output, location_output])
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="categorical_crossentropy",
-        metrics=["accuracy"],
+        loss={
+            "device": "categorical_crossentropy",
+            "location": "categorical_crossentropy",
+        },
+        loss_weights={"device": 1.0, "location": 0.5},
+        metrics={
+            "device": ["accuracy"],
+            "location": ["accuracy"],
+        },
     )
     return model

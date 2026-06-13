@@ -11,7 +11,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 
-from config import BATCH_SIZE, CLASSES, EPOCHS, NUM_CLASSES, SEED
+from config import BATCH_SIZE, CLASSES, EPOCHS, NUM_CLASSES, NUM_LOCATIONS, SEED, LOCATIONS
 from dataset import build_dataset, load_manifest, split_dataset
 from evaluation import (
     save_confusion_matrix_plot,
@@ -80,26 +80,29 @@ def main() -> None:
     tf.random.set_seed(args.seed)
 
     if args.manifest:
-        x_train, y_train = build_dataset(
+        x_train, y_dev_train, y_loc_train = build_dataset(
             manifest_path=args.manifest,
             split="train",
             classes=CLASSES,
+            locations=LOCATIONS,
             balance=not args.no_balance,
             seed=args.seed,
             max_windows_per_class=args.max_windows_per_class,
         )
-        x_val, y_val = build_dataset(
+        x_val, y_dev_val, y_loc_val = build_dataset(
             manifest_path=args.manifest,
             split="validation",
             classes=CLASSES,
+            locations=LOCATIONS,
             balance=not args.no_balance,
             seed=args.seed,
             max_windows_per_class=args.max_windows_per_class,
         )
-        x_test, y_test = build_dataset(
+        x_test, y_dev_test, y_loc_test = build_dataset(
             manifest_path=args.manifest,
             split="test",
             classes=CLASSES,
+            locations=LOCATIONS,
             balance=not args.no_balance,
             seed=args.seed,
             allow_missing=True,
@@ -108,18 +111,25 @@ def main() -> None:
         split_strategy = "recording_manifest"
         source_metadata = manifest_summary(args.manifest)
     else:
-        x, y = build_dataset(
+        x, y_device, y_location = build_dataset(
             args.data_dir,
             classes=CLASSES,
+            locations=LOCATIONS,
             balance=not args.no_balance,
             seed=args.seed,
             max_windows_per_class=args.max_windows_per_class,
         )
         print(f"Dataset shape: {x.shape}")
-        print(f"Label distribution: {class_distribution(y)}")
-        x_train, x_val, x_test, y_train, y_val, y_test = split_dataset(
+        print(f"Device label distribution: {class_distribution(y_device)}")
+        print(f"Location label distribution: {class_distribution(y_location)}")
+        (
+            x_train, x_val, x_test,
+            y_dev_train, y_dev_val, y_dev_test,
+            y_loc_train, y_loc_val, y_loc_test,
+        ) = split_dataset(
             x,
-            y,
+            y_device,
+            y_location,
             test_size=0.10,
             validation_size=0.10,
             seed=args.seed,
@@ -128,17 +138,23 @@ def main() -> None:
         source_metadata = {"data_dir": str(args.data_dir)}
 
     print(f"Split strategy: {split_strategy}")
-    print(f"Train shape/distribution: {x_train.shape} / {class_distribution(y_train)}")
-    print(f"Validation shape/distribution: {x_val.shape} / {class_distribution(y_val)}")
-    print(f"Test shape/distribution: {x_test.shape} / {class_distribution(y_test)}")
+    print(f"Train shape/device distribution: {x_train.shape} / {class_distribution(y_dev_train)}")
+    print(f"Train location distribution: {class_distribution(y_loc_train)}")
+    print(f"Validation shape/device distribution: {x_val.shape} / {class_distribution(y_dev_val)}")
+    print(f"Test shape/device distribution: {x_test.shape} / {class_distribution(y_dev_test)}")
 
-    y_train_cat = tf.keras.utils.to_categorical(y_train, NUM_CLASSES)
-    y_val_cat = tf.keras.utils.to_categorical(y_val, NUM_CLASSES)
-    y_test_cat = tf.keras.utils.to_categorical(y_test, NUM_CLASSES)
+    y_dev_train_cat = tf.keras.utils.to_categorical(y_dev_train, NUM_CLASSES)
+    y_dev_val_cat = tf.keras.utils.to_categorical(y_dev_val, NUM_CLASSES)
+    y_dev_test_cat = tf.keras.utils.to_categorical(y_dev_test, NUM_CLASSES)
+
+    y_loc_train_cat = tf.keras.utils.to_categorical(y_loc_train, NUM_LOCATIONS)
+    y_loc_val_cat = tf.keras.utils.to_categorical(y_loc_val, NUM_LOCATIONS)
+    y_loc_test_cat = tf.keras.utils.to_categorical(y_loc_test, NUM_LOCATIONS)
 
     model = build_cnn(
         input_shape=x_train.shape[1:],
         num_classes=NUM_CLASSES,
+        num_locations=NUM_LOCATIONS,
         learning_rate=args.learning_rate,
         pooling=args.pooling,
     )
@@ -154,14 +170,16 @@ def main() -> None:
             verbose=1,
         ),
         EarlyStopping(
-            monitor="val_accuracy",
+            monitor="val_device_accuracy",
+            mode="max",
             patience=6,
             restore_best_weights=True,
             verbose=1,
         ),
         ModelCheckpoint(
             str(best_model_path),
-            monitor="val_accuracy",
+            monitor="val_device_accuracy",
+            mode="max",
             save_best_only=True,
             verbose=1,
         ),
@@ -169,10 +187,13 @@ def main() -> None:
 
     history = model.fit(
         x_train,
-        y_train_cat,
+        {"device": y_dev_train_cat, "location": y_loc_train_cat},
         epochs=args.epochs,
         batch_size=args.batch_size,
-        validation_data=(x_val, y_val_cat),
+        validation_data=(
+            x_val,
+            {"device": y_dev_val_cat, "location": y_loc_val_cat},
+        ),
         callbacks=callbacks,
         verbose=1,
     )
@@ -180,22 +201,41 @@ def main() -> None:
     final_model_path = args.output_dir / "final_iot_classifier.h5"
     model.save(str(final_model_path))
 
-    test_loss, test_accuracy = model.evaluate(x_test, y_test_cat, verbose=0)
-    pred_probs = model.predict(x_test)
-    pred_classes = np.argmax(pred_probs, axis=1)
-
-    report_path = args.output_dir / "classification_report.txt"
-    report = write_classification_report(y_test, pred_classes, CLASSES, report_path)
-    save_confusion_matrix_plot(
-        y_test,
-        pred_classes,
-        CLASSES,
-        args.output_dir / "confusion_matrix.png",
+    test_results = model.evaluate(
+        x_test,
+        {"device": y_dev_test_cat, "location": y_loc_test_cat},
+        verbose=0,
     )
+    metrics_names = model.metrics_names
+    test_metrics = dict(zip(metrics_names, test_results))
+
+    pred_device_probs, pred_location_probs = model.predict(x_test)
+    pred_device_classes = np.argmax(pred_device_probs, axis=1)
+    pred_location_classes = np.argmax(pred_location_probs, axis=1)
+
+    device_report_path = args.output_dir / "device_classification_report.txt"
+    device_report = write_classification_report(y_dev_test, pred_device_classes, CLASSES, device_report_path)
+    save_confusion_matrix_plot(
+        y_dev_test,
+        pred_device_classes,
+        CLASSES,
+        args.output_dir / "device_confusion_matrix.png",
+    )
+
+    location_report_path = args.output_dir / "location_classification_report.txt"
+    location_report = write_classification_report(y_loc_test, pred_location_classes, LOCATIONS, location_report_path)
+    save_confusion_matrix_plot(
+        y_loc_test,
+        pred_location_classes,
+        LOCATIONS,
+        args.output_dir / "location_confusion_matrix.png",
+    )
+
     save_training_curves(history, args.output_dir / "training_curves.png")
 
     metadata = {
         "classes": CLASSES,
+        "locations": LOCATIONS,
         "split_strategy": split_strategy,
         "source": source_metadata,
         "test_evaluation_role": (
@@ -204,9 +244,8 @@ def main() -> None:
             else "random-window-holdout-from-training-source-recordings"
         ),
         "test_evaluation_unit": "non_overlapping_window",
-        "test_samples": int(len(y_test)),
-        "test_loss": float(test_loss),
-        "test_accuracy": float(test_accuracy),
+        "test_samples": int(len(y_dev_test)),
+        "test_metrics": {k: float(v) for k, v in test_metrics.items()},
         "input_shape": list(x_train.shape[1:]),
         "balanced": not args.no_balance,
         "max_windows_per_class": args.max_windows_per_class,
@@ -217,8 +256,12 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    print(f"\nTest accuracy: {test_accuracy:.4f}")
-    print(report)
+    print(f"\nTest device accuracy: {test_metrics.get('device_accuracy', 0.0):.4f}")
+    print(f"Test location accuracy: {test_metrics.get('location_accuracy', 0.0):.4f}")
+    print("\n--- Device Classification Report ---")
+    print(device_report)
+    print("\n--- Location Classification Report ---")
+    print(location_report)
     print(f"Saved best model: {best_model_path}")
     print(f"Saved final model: {final_model_path}")
 

@@ -10,13 +10,14 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
-from config import WINDOW_SIZE
+from config import WINDOW_SIZE, LOCATIONS
 from dataset import legacy_recordings, load_manifest
 from evaluation import (
     save_confusion_matrix_plot,
     write_classification_report,
 )
-from infer import load_classes, predict_signal
+from infer import load_classes, load_locations, predict_signal
+from model import StopGradientLayer  # noqa: F401 - registers layer for load_model
 
 
 def wilson_confidence_interval(
@@ -90,13 +91,17 @@ def write_file_predictions(
             fieldnames=[
                 "file",
                 "true_label",
+                "predicted_label",
+                "confidence",
+                "true_location",
+                "predicted_location",
+                "location_confidence",
                 "scenario",
                 "capture_id",
                 "split",
-                "predicted_label",
-                "confidence",
+                "device_correct",
+                "location_correct",
                 "windows",
-                "correct",
             ],
         )
         writer.writeheader()
@@ -118,6 +123,7 @@ def run_test(
 ) -> dict[str, object]:
     """Run file-level sliding-window ensemble tests and save reports."""
     classes = load_classes(metadata_path)
+    locations = load_locations(metadata_path)
     if manifest_path:
         recordings = load_manifest(manifest_path, classes=classes, split=manifest_split)
         if not allow_missing:
@@ -140,9 +146,12 @@ def run_test(
 
     model = tf.keras.models.load_model(str(model_path))
     rows: list[dict[str, object]] = []
-    probabilities_by_file: dict[str, dict[str, float]] = {}
-    y_true: list[int] = []
-    y_pred: list[int] = []
+    probabilities_by_file: dict[str, dict[str, object]] = {}
+    
+    y_dev_true: list[int] = []
+    y_dev_pred: list[int] = []
+    y_loc_true: list[int] = []
+    y_loc_pred: list[int] = []
 
     for recording in recordings:
         signal = np.load(recording.path)
@@ -150,53 +159,101 @@ def run_test(
             model,
             signal,
             classes,
+            locations=locations,
             window_size=window_size,
             step=step,
         )
 
-        true_idx = classes.index(recording.class_name)
-        pred_idx = classes.index(str(result["prediction"]))
-        correct = int(true_idx == pred_idx)
+        true_dev_idx = classes.index(recording.class_name)
+        pred_dev_idx = classes.index(str(result["prediction"]))
+        dev_correct = int(true_dev_idx == pred_dev_idx)
 
-        y_true.append(true_idx)
-        y_pred.append(pred_idx)
-        probabilities_by_file[str(recording.path)] = result["probabilities"]
+        # True location
+        scenario = recording.scenario
+        if scenario in locations:
+            true_loc_idx = locations.index(scenario)
+        else:
+            true_loc_idx = -1
+        
+        pred_loc_idx = locations.index(str(result["location"]))
+        loc_correct = int(true_loc_idx == pred_loc_idx)
+
+        y_dev_true.append(true_dev_idx)
+        y_dev_pred.append(pred_dev_idx)
+        
+        if true_loc_idx >= 0:
+            y_loc_true.append(true_loc_idx)
+            y_loc_pred.append(pred_loc_idx)
+
+        probabilities_by_file[str(recording.path)] = {
+            "device_probabilities": result["device_probabilities"],
+            "location_probabilities": result["location_probabilities"],
+        }
+        
         rows.append(
             {
                 "file": str(recording.path),
                 "true_label": recording.class_name,
-                "scenario": recording.scenario,
+                "predicted_label": result["prediction"],
+                "confidence": f"{float(result['device_confidence']):.8f}",
+                "true_location": scenario,
+                "predicted_location": result["location"],
+                "location_confidence": f"{float(result['location_confidence']):.8f}",
+                "scenario": scenario,
                 "capture_id": recording.capture_id,
                 "split": recording.split or "",
-                "predicted_label": result["prediction"],
-                "confidence": f"{float(result['confidence']):.8f}",
+                "device_correct": dev_correct,
+                "location_correct": loc_correct,
                 "windows": int(result["windows"]),
-                "correct": correct,
             }
         )
 
-    y_true_array = np.asarray(y_true, dtype=np.int64)
-    y_pred_array = np.asarray(y_pred, dtype=np.int64)
-    correct_files = int(np.sum(y_true_array == y_pred_array))
-    accuracy = float(correct_files / len(y_true_array)) if len(y_true_array) else 0.0
-    accuracy_ci_low, accuracy_ci_high = wilson_confidence_interval(
-        correct_files,
-        len(y_true_array),
+    y_dev_true_array = np.asarray(y_dev_true, dtype=np.int64)
+    y_dev_pred_array = np.asarray(y_dev_pred, dtype=np.int64)
+    correct_dev_files = int(np.sum(y_dev_true_array == y_dev_pred_array))
+    dev_accuracy = float(correct_dev_files / len(y_dev_true_array)) if len(y_dev_true_array) else 0.0
+    dev_accuracy_ci_low, dev_accuracy_ci_high = wilson_confidence_interval(
+        correct_dev_files,
+        len(y_dev_true_array),
     )
+
+    y_loc_true_array = np.asarray(y_loc_true, dtype=np.int64)
+    y_loc_pred_array = np.asarray(y_loc_pred, dtype=np.int64)
+    correct_loc_files = int(np.sum(y_loc_true_array == y_loc_pred_array))
+    loc_accuracy = float(correct_loc_files / len(y_loc_true_array)) if len(y_loc_true_array) else 0.0
+    loc_accuracy_ci_low, loc_accuracy_ci_high = wilson_confidence_interval(
+        correct_loc_files,
+        len(y_loc_true_array),
+    )
+
     scenario_metrics = summarize_scenarios(rows)
 
-    report = write_classification_report(
-        y_true_array,
-        y_pred_array,
+    device_report = write_classification_report(
+        y_dev_true_array,
+        y_dev_pred_array,
         classes,
-        output_dir / "classification_report.txt",
+        output_dir / "device_classification_report.txt",
     )
     save_confusion_matrix_plot(
-        y_true_array,
-        y_pred_array,
+        y_dev_true_array,
+        y_dev_pred_array,
         classes,
-        output_dir / "confusion_matrix.png",
+        output_dir / "device_confusion_matrix.png",
     )
+
+    location_report = write_classification_report(
+        y_loc_true_array,
+        y_loc_pred_array,
+        locations,
+        output_dir / "location_classification_report.txt",
+    )
+    save_confusion_matrix_plot(
+        y_loc_true_array,
+        y_loc_pred_array,
+        locations,
+        output_dir / "location_confusion_matrix.png",
+    )
+
     write_file_predictions(rows, output_dir / "predictions.csv")
     (output_dir / "probabilities.json").write_text(
         json.dumps(probabilities_by_file, indent=2),
@@ -211,11 +268,17 @@ def run_test(
         "manifest_split": manifest_split if manifest_path else None,
         "model": str(model_path),
         "files": len(rows),
-        "correct_files": correct_files,
-        "accuracy": accuracy,
-        "accuracy_ci_95_wilson": {
-            "low": accuracy_ci_low,
-            "high": accuracy_ci_high,
+        "correct_device_files": correct_dev_files,
+        "device_accuracy": dev_accuracy,
+        "device_accuracy_ci_95_wilson": {
+            "low": dev_accuracy_ci_low,
+            "high": dev_accuracy_ci_high,
+        },
+        "correct_location_files": correct_loc_files,
+        "location_accuracy": loc_accuracy,
+        "location_accuracy_ci_95_wilson": {
+            "low": loc_accuracy_ci_low,
+            "high": loc_accuracy_ci_high,
         },
         "interpretation": "Each file contributes one prediction; window count is not the number of independent test examples.",
         "scenario_metrics": scenario_metrics,
@@ -229,8 +292,12 @@ def run_test(
 
     source = f"{manifest_path} split={manifest_split}" if manifest_path else str(data_dir)
     print(f"Tested {len(rows)} files from {source}")
-    print(f"File-level accuracy: {accuracy:.4f}")
-    print(report)
+    print(f"File-level Device Accuracy: {dev_accuracy:.4f}")
+    print(f"File-level Location Accuracy: {loc_accuracy:.4f}")
+    print("\n--- Device Classification Report ---")
+    print(device_report)
+    print("\n--- Location Classification Report ---")
+    print(location_report)
     print(f"Saved reports to: {output_dir}")
 
     return metrics
@@ -238,22 +305,46 @@ def run_test(
 
 def summarize_scenarios(rows: list[dict[str, object]]) -> dict[str, dict[str, object]]:
     """Summarize independent file-level outcomes for each scenario."""
-    grouped: dict[str, list[int]] = {}
+    grouped_dev: dict[str, list[int]] = {}
+    grouped_loc: dict[str, list[int]] = {}
     for row in rows:
         scenario = str(row.get("scenario") or "unspecified")
-        grouped.setdefault(scenario, []).append(int(row["correct"]))
+        correct_dev = row.get("device_correct", row.get("correct"))
+        if correct_dev is not None:
+            grouped_dev.setdefault(scenario, []).append(int(correct_dev))
+        
+        correct_loc = row.get("location_correct")
+        if correct_loc is not None:
+            grouped_loc.setdefault(scenario, []).append(int(correct_loc))
 
     summary: dict[str, dict[str, object]] = {}
-    for scenario, correctness in sorted(grouped.items()):
-        files = len(correctness)
-        correct_files = int(sum(correctness))
-        low, high = wilson_confidence_interval(correct_files, files)
-        summary[scenario] = {
-            "files": files,
-            "correct_files": correct_files,
-            "accuracy": float(correct_files / files),
-            "accuracy_ci_95_wilson": {"low": low, "high": high},
-        }
+    for scenario in sorted(set(grouped_dev.keys()).union(grouped_loc.keys())):
+        dev_corr = grouped_dev.get(scenario, [])
+        loc_corr = grouped_loc.get(scenario, [])
+        files = max(len(dev_corr), len(loc_corr))
+        
+        entry = {"files": files}
+        
+        if dev_corr:
+            dev_correct_files = int(sum(dev_corr))
+            dev_low, dev_high = wilson_confidence_interval(dev_correct_files, len(dev_corr))
+            if not loc_corr:
+                entry["correct_files"] = dev_correct_files
+                entry["accuracy"] = float(dev_correct_files / len(dev_corr))
+                entry["accuracy_ci_95_wilson"] = {"low": dev_low, "high": dev_high}
+            else:
+                entry["device_correct_files"] = dev_correct_files
+                entry["device_accuracy"] = float(dev_correct_files / len(dev_corr))
+                entry["device_accuracy_ci_95_wilson"] = {"low": dev_low, "high": dev_high}
+                
+        if loc_corr:
+            loc_correct_files = int(sum(loc_corr))
+            loc_low, loc_high = wilson_confidence_interval(loc_correct_files, len(loc_corr))
+            entry["location_correct_files"] = loc_correct_files
+            entry["location_accuracy"] = float(loc_correct_files / len(loc_corr))
+            entry["location_accuracy_ci_95_wilson"] = {"low": loc_low, "high": loc_high}
+            
+        summary[scenario] = entry
     return summary
 
 

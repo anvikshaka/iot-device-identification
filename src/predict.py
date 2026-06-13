@@ -9,7 +9,7 @@ import numpy as np
 import tensorflow as tf
 
 from config import CLASSES, WINDOW_SIZE
-from infer import load_classes, predict_signal
+from infer import load_classes, load_locations, predict_signal
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +47,7 @@ def main() -> None:
         return
 
     classes = load_classes(args.metadata)
+    locations = load_locations(args.metadata)
 
     print("Loading model...")
     model = tf.keras.models.load_model(str(args.model))
@@ -59,21 +60,30 @@ def main() -> None:
         model,
         signal,
         classes,
+        locations=locations,
         window_size=args.window_size,
         step=args.step,
     )
 
     device = result["prediction"]
-    conf = result["confidence"]
+    location = result["location"]
+    device_conf = result["device_confidence"]
+    location_conf = result["location_confidence"]
     n_windows = result["windows"]
 
     print(f"\n--- Ensemble Results ({n_windows} windows) ---")
-    print(f"Final Consolidated Prediction: {device}")
-    print(f"Confidence Level: {conf * 100:.2f}%")
+    print(f"Final Consolidated Device Prediction: {device}")
+    print(f"Device Confidence Level: {device_conf * 100:.2f}%")
+    print(f"Final Consolidated Location Prediction: {location}")
+    print(f"Location Confidence Level: {location_conf * 100:.2f}%")
 
-    print("\nPer-class probabilities:")
-    for class_name, prob in result["probabilities"].items():
+    print("\nPer-device probabilities:")
+    for class_name, prob in result["device_probabilities"].items():
         print(f"  {class_name:>12s}: {prob * 100:.2f}%")
+
+    print("\nPer-location probabilities:")
+    for loc_name, prob in result["location_probabilities"].items():
+        print(f"  {loc_name:>12s}: {prob * 100:.2f}%")
 
     print("\nConfidence is an averaged model score across windows, not an accuracy estimate.")
 

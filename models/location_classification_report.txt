@@ -1,0 +1,9 @@
+              precision    recall  f1-score   support
+
+ anotherroom       0.80      0.72      0.76      5990
+    sameroom       0.00      0.00      0.00         0
+    upstairs       0.75      0.82      0.78      6010
+
+    accuracy                           0.77     12000
+   macro avg       0.51      0.51      0.51     12000
+weighted avg       0.77      0.77      0.77     12000

@@ -65,13 +65,13 @@ def test_build_dataset_combines_recordings_then_balances_classes(tmp_path):
     write_manifest(
         manifest,
         [
-            {"path": microphone_a, "class": "microphone", "scenario": "room", "capture_id": "01", "split": "train"},
+            {"path": microphone_a, "class": "microphone", "scenario": "sameroom", "capture_id": "01", "split": "train"},
             {"path": microphone_b, "class": "microphone", "scenario": "upstairs", "capture_id": "02", "split": "train"},
-            {"path": lora, "class": "lora", "scenario": "room", "capture_id": "01", "split": "train"},
+            {"path": lora, "class": "lora", "scenario": "sameroom", "capture_id": "01", "split": "train"},
         ],
     )
 
-    x, y = build_dataset(
+    x, y_dev, y_loc = build_dataset(
         manifest_path=manifest,
         split="train",
         classes=["microphone", "lora"],
@@ -79,7 +79,7 @@ def test_build_dataset_combines_recordings_then_balances_classes(tmp_path):
     )
 
     assert x.shape == (4, 257, 61, 1)
-    assert np.bincount(y).tolist() == [2, 2]
+    assert np.bincount(y_dev).tolist() == [2, 2]
 
 
 def test_manifest_rejects_a_capture_assigned_to_multiple_splits(tmp_path):
@@ -89,8 +89,8 @@ def test_manifest_rejects_a_capture_assigned_to_multiple_splits(tmp_path):
     write_manifest(
         manifest,
         [
-            {"path": recording, "class": "microphone", "scenario": "room", "capture_id": "01", "split": "train"},
-            {"path": recording, "class": "microphone", "scenario": "room", "capture_id": "01", "split": "test"},
+            {"path": recording, "class": "microphone", "scenario": "sameroom", "capture_id": "01", "split": "train"},
+            {"path": recording, "class": "microphone", "scenario": "sameroom", "capture_id": "01", "split": "test"},
         ],
     )
 
@@ -109,7 +109,7 @@ def test_focused_test_split_can_score_only_one_configured_class(tmp_path):
         ],
     )
 
-    x, y = build_dataset(
+    x, y_dev, y_loc = build_dataset(
         manifest_path=manifest,
         split="test",
         classes=["microphone", "lora"],
@@ -117,7 +117,7 @@ def test_focused_test_split_can_score_only_one_configured_class(tmp_path):
     )
 
     assert x.shape[0] == 1
-    assert y.tolist() == [0]
+    assert y_dev.tolist() == [0]
 
 
 def test_window_cap_is_applied_per_class_before_model_input_creation(tmp_path):
@@ -129,12 +129,12 @@ def test_window_cap_is_applied_per_class_before_model_input_creation(tmp_path):
     write_manifest(
         manifest,
         [
-            {"path": microphone, "class": "microphone", "scenario": "room", "capture_id": "01", "split": "train"},
-            {"path": lora, "class": "lora", "scenario": "room", "capture_id": "01", "split": "train"},
+            {"path": microphone, "class": "microphone", "scenario": "sameroom", "capture_id": "01", "split": "train"},
+            {"path": lora, "class": "lora", "scenario": "sameroom", "capture_id": "01", "split": "train"},
         ],
     )
 
-    x, y = build_dataset(
+    x, y_dev, y_loc = build_dataset(
         manifest_path=manifest,
         split="train",
         classes=["microphone", "lora"],
@@ -142,4 +142,4 @@ def test_window_cap_is_applied_per_class_before_model_input_creation(tmp_path):
     )
 
     assert x.shape == (2, 257, 61, 1)
-    assert sorted(y.tolist()) == [0, 1]
+    assert sorted(y_dev.tolist()) == [0, 1]
