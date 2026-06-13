@@ -4,9 +4,16 @@ from __future__ import annotations
 
 WINDOW_SIZE = 4096
 NUM_CLASSES = 6
+NUM_LOCATIONS = 3
 BATCH_SIZE = 32
 EPOCHS = 50
 SEED = 42
+
+LOCATIONS = [
+    "anotherroom",
+    "sameroom",
+    "upstairs",
+]
 
 CLASSES = [
     "dooralarm",

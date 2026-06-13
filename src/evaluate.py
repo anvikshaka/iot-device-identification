@@ -16,7 +16,8 @@ from evaluation import (
     save_confusion_matrix_plot,
     write_classification_report,
 )
-from infer import load_classes
+from infer import load_classes, load_locations
+from model import StopGradientLayer  # noqa: F401 - registers layer for load_model
 from preprocessing import class_distribution
 
 
@@ -69,10 +70,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def write_predictions_csv(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    confidences: np.ndarray,
+    y_dev_true: np.ndarray,
+    y_dev_pred: np.ndarray,
+    device_confidences: np.ndarray,
+    y_loc_true: np.ndarray,
+    y_loc_pred: np.ndarray,
+    location_confidences: np.ndarray,
     classes: list[str],
+    locations: list[str],
     output_path: Path,
 ) -> None:
     """Write one row per evaluated window."""
@@ -81,21 +86,31 @@ def write_predictions_csv(
             handle,
             fieldnames=[
                 "index",
-                "true_label",
-                "predicted_label",
-                "confidence",
-                "correct",
+                "true_device",
+                "predicted_device",
+                "device_confidence",
+                "device_correct",
+                "true_location",
+                "predicted_location",
+                "location_confidence",
+                "location_correct",
             ],
         )
         writer.writeheader()
-        for idx, (true_idx, pred_idx, confidence) in enumerate(zip(y_true, y_pred, confidences)):
+        for idx, (t_dev, p_dev, c_dev, t_loc, p_loc, c_loc) in enumerate(
+            zip(y_dev_true, y_dev_pred, device_confidences, y_loc_true, y_loc_pred, location_confidences)
+        ):
             writer.writerow(
                 {
                     "index": idx,
-                    "true_label": classes[int(true_idx)],
-                    "predicted_label": classes[int(pred_idx)],
-                    "confidence": f"{float(confidence):.8f}",
-                    "correct": int(true_idx == pred_idx),
+                    "true_device": classes[int(t_dev)],
+                    "predicted_device": classes[int(p_dev)],
+                    "device_confidence": f"{float(c_dev):.8f}",
+                    "device_correct": int(t_dev == p_dev),
+                    "true_location": locations[int(t_loc)] if t_loc >= 0 else "unspecified",
+                    "predicted_location": locations[int(p_loc)] if p_loc >= 0 else "unspecified",
+                    "location_confidence": f"{float(c_loc):.8f}",
+                    "location_correct": int(t_loc == p_loc),
                 }
             )
 
@@ -122,11 +137,13 @@ def run_evaluation(
         raise ValueError(f"evaluation_role must be one of: {expected}")
 
     classes = load_classes(metadata_path)
+    locations = load_locations(metadata_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    x, y = build_dataset(
+    x, y_dev, y_loc = build_dataset(
         data_dir,
         classes=classes,
+        locations=locations,
         window_size=window_size,
         balance=balance,
         seed=seed,
@@ -138,30 +155,58 @@ def run_evaluation(
     )
 
     model = tf.keras.models.load_model(str(model_path))
-    y_cat = tf.keras.utils.to_categorical(y, len(classes))
+    y_dev_cat = tf.keras.utils.to_categorical(y_dev, len(classes))
+    y_loc_cat = tf.keras.utils.to_categorical(y_loc, len(locations))
 
-    loss, accuracy = model.evaluate(x, y_cat, batch_size=batch_size, verbose=0)
-    probabilities = model.predict(x, batch_size=batch_size, verbose=0)
-    y_pred = np.argmax(probabilities, axis=1)
-    confidences = np.max(probabilities, axis=1)
+    test_metrics = model.evaluate(
+        x,
+        {"device": y_dev_cat, "location": y_loc_cat},
+        batch_size=batch_size,
+        verbose=0,
+        return_dict=True,
+    )
 
-    report = write_classification_report(
-        y,
-        y_pred,
+    device_probs, location_probs = model.predict(x, batch_size=batch_size, verbose=0)
+    y_dev_pred = np.argmax(device_probs, axis=1)
+    y_loc_pred = np.argmax(location_probs, axis=1)
+    device_confidences = np.max(device_probs, axis=1)
+    location_confidences = np.max(location_probs, axis=1)
+
+    device_report = write_classification_report(
+        y_dev,
+        y_dev_pred,
         classes,
-        output_dir / "classification_report.txt",
+        output_dir / "device_classification_report.txt",
     )
     save_confusion_matrix_plot(
-        y,
-        y_pred,
+        y_dev,
+        y_dev_pred,
         classes,
-        output_dir / "confusion_matrix.png",
+        output_dir / "device_confusion_matrix.png",
     )
+
+    location_report = write_classification_report(
+        y_loc,
+        y_loc_pred,
+        locations,
+        output_dir / "location_classification_report.txt",
+    )
+    save_confusion_matrix_plot(
+        y_loc,
+        y_loc_pred,
+        locations,
+        output_dir / "location_confusion_matrix.png",
+    )
+
     write_predictions_csv(
-        y,
-        y_pred,
-        confidences,
+        y_dev,
+        y_dev_pred,
+        device_confidences,
+        y_loc,
+        y_loc_pred,
+        location_confidences,
         classes,
+        locations,
         output_dir / "predictions.csv",
     )
 
@@ -172,11 +217,10 @@ def run_evaluation(
         "manifest": str(manifest_path) if manifest_path else None,
         "manifest_split": manifest_split if manifest_path else None,
         "model": str(model_path),
-        "samples": int(len(y)),
-        "loss": float(loss),
-        "accuracy": float(accuracy),
+        "samples": int(len(y_dev)),
+        "test_metrics": {k: float(v) for k, v in test_metrics.items()},
         "class_distribution": {
-            classes[label]: count for label, count in class_distribution(y).items()
+            classes[label]: count for label, count in class_distribution(y_dev).items()
         },
         "balanced": bool(balance),
         "max_windows_per_class": max_windows_per_class,
@@ -187,10 +231,14 @@ def run_evaluation(
     )
 
     source = f"{manifest_path} split={manifest_split}" if manifest_path else str(data_dir)
-    print(f"Evaluated {len(y)} windows from {source}")
+    print(f"Evaluated {len(y_dev)} windows from {source}")
     print(f"Evaluation role: {evaluation_role}")
-    print(f"Accuracy: {accuracy:.4f}")
-    print(report)
+    print(f"Device Accuracy: {test_metrics.get('device_accuracy', 0.0):.4f}")
+    print(f"Location Accuracy: {test_metrics.get('location_accuracy', 0.0):.4f}")
+    print("\n--- Device Classification Report ---")
+    print(device_report)
+    print("\n--- Location Classification Report ---")
+    print(location_report)
     print(f"Saved reports to: {output_dir}")
 
     return metrics

@@ -11,14 +11,15 @@ import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
-from config import BATCH_SIZE, CLASSES, EPOCHS, NUM_CLASSES, SEED
+from aggregation import AGGREGATION_MODES
+from config import BATCH_SIZE, CLASSES, EPOCHS, NUM_CLASSES, NUM_LOCATIONS, SEED, LOCATIONS
 from dataset import build_dataset_from_recordings, load_manifest
 from evaluation import (
     save_confusion_matrix_plot,
     write_classification_report,
 )
-from infer import predict_signal
-from model import build_cnn
+from infer import load_classes, load_locations, predict_signal
+from model import build_cnn, StopGradientLayer  # noqa: F401 - registers layer for load_model
 from test import wilson_confidence_interval, write_file_predictions
 
 
@@ -49,6 +50,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--no-balance", action="store_true")
+    parser.add_argument(
+        "--aggregation",
+        choices=AGGREGATION_MODES,
+        default="mean",
+        help="How to combine per-window probabilities into file-level predictions.",
+    )
+    parser.add_argument(
+        "--top-fraction",
+        type=float,
+        default=0.25,
+        help="Fraction of most confident windows used by top_confidence_mean aggregation.",
+    )
     parser.add_argument(
         "--max-windows-per-class",
         type=int,
@@ -103,14 +116,19 @@ def main() -> None:
     tf.random.set_seed(args.seed)
 
     recordings = load_manifest(args.manifest, classes=CLASSES)
+    locations = LOCATIONS
     folds = get_folds(recordings, args.mode)
     print(f"Starting Cross-Validation (Mode: {args.mode.upper()}) with {len(folds)} folds.")
     print(f"Architecture configuration: pooling={args.pooling}, epochs={args.epochs}")
 
-    fold_accuracies: list[float] = []
+    fold_dev_accuracies: list[float] = []
+    fold_loc_accuracies: list[float] = []
     all_predictions_rows: list[dict[str, object]] = []
-    y_true_all: list[int] = []
-    y_pred_all: list[int] = []
+    
+    y_dev_true_all: list[int] = []
+    y_dev_pred_all: list[int] = []
+    y_loc_true_all: list[int] = []
+    y_loc_pred_all: list[int] = []
 
     for idx, (fold_name, train_recs, test_recs) in enumerate(folds, start=1):
         print(f"\n--- Fold {idx}/{len(folds)}: {fold_name} ---")
@@ -118,43 +136,54 @@ def main() -> None:
 
         # Build training / validation window datasets
         # We extract all windows from train_recs and split them 85% train, 15% val
-        x_train_val, y_train_val = build_dataset_from_recordings(
+        x_train_val, y_dev_train_val, y_loc_train_val = build_dataset_from_recordings(
             train_recs,
             classes=CLASSES,
+            locations=locations,
             balance=not args.no_balance,
             seed=args.seed,
             max_windows_per_class=args.max_windows_per_class,
         )
 
-        x_train, x_val, y_train, y_val = train_test_split(
+        (
+            x_train, x_val,
+            y_dev_train, y_dev_val,
+            y_loc_train, y_loc_val,
+        ) = train_test_split(
             x_train_val,
-            y_train_val,
+            y_dev_train_val,
+            y_loc_train_val,
             test_size=0.15,
-            stratify=y_train_val,
+            stratify=y_dev_train_val,
             random_state=args.seed,
         )
 
-        y_train_cat = tf.keras.utils.to_categorical(y_train, NUM_CLASSES)
-        y_val_cat = tf.keras.utils.to_categorical(y_val, NUM_CLASSES)
+        y_dev_train_cat = tf.keras.utils.to_categorical(y_dev_train, NUM_CLASSES)
+        y_dev_val_cat = tf.keras.utils.to_categorical(y_dev_val, NUM_CLASSES)
+        y_loc_train_cat = tf.keras.utils.to_categorical(y_loc_train, NUM_LOCATIONS)
+        y_loc_val_cat = tf.keras.utils.to_categorical(y_loc_val, NUM_LOCATIONS)
 
         # Build and compile model
         model = build_cnn(
             input_shape=x_train.shape[1:],
             num_classes=NUM_CLASSES,
+            num_locations=NUM_LOCATIONS,
             learning_rate=args.learning_rate,
             pooling=args.pooling,
         )
 
         callbacks = [
             ReduceLROnPlateau(
-                monitor="val_loss",
+                monitor="val_device_loss",
                 factor=0.5,
                 patience=3,
                 min_lr=1e-6,
+                mode="min",
                 verbose=0,
             ),
             EarlyStopping(
-                monitor="val_accuracy",
+                monitor="val_device_accuracy",
+                mode="max",
                 patience=6,
                 restore_best_weights=True,
                 verbose=0,
@@ -164,87 +193,148 @@ def main() -> None:
         # Fit model
         model.fit(
             x_train,
-            y_train_cat,
+            {"device": y_dev_train_cat, "location": y_loc_train_cat},
             epochs=args.epochs,
             batch_size=args.batch_size,
-            validation_data=(x_val, y_val_cat),
+            validation_data=(
+                x_val,
+                {"device": y_dev_val_cat, "location": y_loc_val_cat},
+            ),
             callbacks=callbacks,
             verbose=0,
         )
 
         # Evaluate on test recordings at the file (ensemble) level
-        correct_fold = 0
+        correct_dev_fold = 0
+        correct_loc_fold = 0
+        valid_loc_count = 0
+        
         for recording in test_recs:
             signal = np.load(recording.path)
             result = predict_signal(
                 model,
                 signal,
                 CLASSES,
+                locations=locations,
                 window_size=4096,
                 step=1024,
+                aggregation=args.aggregation,
+                top_fraction=args.top_fraction,
             )
 
-            true_idx = CLASSES.index(recording.class_name)
-            pred_idx = CLASSES.index(str(result["prediction"]))
-            correct = int(true_idx == pred_idx)
-            correct_fold += correct
+            true_dev_idx = CLASSES.index(recording.class_name)
+            pred_dev_idx = CLASSES.index(str(result["prediction"]))
+            dev_correct = int(true_dev_idx == pred_dev_idx)
+            correct_dev_fold += dev_correct
 
-            y_true_all.append(true_idx)
-            y_pred_all.append(pred_idx)
+            # Location handling
+            scenario = recording.scenario
+            if scenario in locations:
+                true_loc_idx = locations.index(scenario)
+                pred_loc_idx = locations.index(str(result["location"]))
+                loc_correct = int(true_loc_idx == pred_loc_idx)
+                correct_loc_fold += loc_correct
+                valid_loc_count += 1
+                
+                y_loc_true_all.append(true_loc_idx)
+                y_loc_pred_all.append(pred_loc_idx)
+            else:
+                loc_correct = 0
+
+            y_dev_true_all.append(true_dev_idx)
+            y_dev_pred_all.append(pred_dev_idx)
 
             all_predictions_rows.append(
                 {
                     "file": str(recording.path),
                     "true_label": recording.class_name,
-                    "scenario": recording.scenario,
+                    "predicted_label": result["prediction"],
+                    "confidence": f"{float(result['device_confidence']):.8f}",
+                    "true_location": scenario,
+                    "predicted_location": result["location"],
+                    "location_confidence": f"{float(result['location_confidence']):.8f}",
+                    "scenario": scenario,
                     "capture_id": recording.capture_id,
                     "split": f"cv_fold_{fold_name}",
-                    "predicted_label": result["prediction"],
-                    "confidence": f"{float(result['confidence']):.8f}",
+                    "device_correct": dev_correct,
+                    "location_correct": loc_correct,
                     "windows": int(result["windows"]),
-                    "correct": correct,
                 }
             )
 
-        fold_acc = correct_fold / len(test_recs)
-        fold_accuracies.append(fold_acc)
-        print(f"Fold accuracy: {fold_acc:.4f} ({correct_fold}/{len(test_recs)} correct files)")
+        fold_dev_acc = correct_dev_fold / len(test_recs)
+        fold_dev_accuracies.append(fold_dev_acc)
+        
+        if valid_loc_count > 0:
+            fold_loc_acc = correct_loc_fold / valid_loc_count
+            fold_loc_accuracies.append(fold_loc_acc)
+            print(f"Fold accuracy: device={fold_dev_acc:.4f} ({correct_dev_fold}/{len(test_recs)} correct), location={fold_loc_acc:.4f} ({correct_loc_fold}/{valid_loc_count} correct)")
+        else:
+            print(f"Fold accuracy: device={fold_dev_acc:.4f} ({correct_dev_fold}/{len(test_recs)} correct)")
 
     # Overall Summary
-    fold_acc_mean = float(np.mean(fold_accuracies))
-    fold_acc_std = float(np.std(fold_accuracies))
+    fold_dev_acc_mean = float(np.mean(fold_dev_accuracies))
+    fold_dev_acc_std = float(np.std(fold_dev_accuracies))
+    
+    fold_loc_acc_mean = float(np.mean(fold_loc_accuracies)) if fold_loc_accuracies else 0.0
+    fold_loc_acc_std = float(np.std(fold_loc_accuracies)) if fold_loc_accuracies else 0.0
 
-    y_true_array = np.asarray(y_true_all, dtype=np.int64)
-    y_pred_array = np.asarray(y_pred_all, dtype=np.int64)
-    total_files = len(y_true_array)
-    total_correct = int(np.sum(y_true_array == y_pred_array))
-    pooled_accuracy = float(total_correct / total_files) if total_files else 0.0
+    y_dev_true_array = np.asarray(y_dev_true_all, dtype=np.int64)
+    y_dev_pred_array = np.asarray(y_dev_pred_all, dtype=np.int64)
+    total_dev_files = len(y_dev_true_array)
+    total_dev_correct = int(np.sum(y_dev_true_array == y_dev_pred_array))
+    pooled_dev_accuracy = float(total_dev_correct / total_dev_files) if total_dev_files else 0.0
+    ci_dev_low, ci_dev_high = wilson_confidence_interval(total_dev_correct, total_dev_files)
 
-    ci_low, ci_high = wilson_confidence_interval(total_correct, total_files)
+    y_loc_true_array = np.asarray(y_loc_true_all, dtype=np.int64)
+    y_loc_pred_array = np.asarray(y_loc_pred_all, dtype=np.int64)
+    total_loc_files = len(y_loc_true_array)
+    total_loc_correct = int(np.sum(y_loc_true_array == y_loc_pred_array))
+    pooled_loc_accuracy = float(total_loc_correct / total_loc_files) if total_loc_files else 0.0
+    ci_loc_low, ci_loc_high = wilson_confidence_interval(total_loc_correct, total_loc_files)
 
     print("\n==================================================")
     print(f"CROSS-VALIDATION SUMMARY (Mode: {args.mode.upper()})")
     print(f"Pooling architecture: {args.pooling}")
     print(f"Folds run: {len(folds)}")
-    print(f"Fold Accuracies: {[f'{acc:.4f}' for acc in fold_accuracies]}")
-    print(f"Fold Accuracy (Mean ± Std): {fold_acc_mean:.4f} ± {fold_acc_std:.4f}")
-    print(f"Pooled File Accuracy: {pooled_accuracy:.4f} ({total_correct}/{total_files} correct)")
-    print(f"Pooled 95% Wilson Score CI: [{ci_low:.4f}, {ci_high:.4f}]")
+    print(f"Fold Device Accuracies: {[f'{acc:.4f}' for acc in fold_dev_accuracies]}")
+    print(f"Fold Device Accuracy (Mean ± Std): {fold_dev_acc_mean:.4f} ± {fold_dev_acc_std:.4f}")
+    print(f"Pooled File Device Accuracy: {pooled_dev_accuracy:.4f} ({total_dev_correct}/{total_dev_files} correct)")
+    print(f"Pooled 95% Wilson Score CI (Device): [{ci_dev_low:.4f}, {ci_dev_high:.4f}]")
+    print("--------------------------------------------------")
+    print(f"Fold Location Accuracies: {[f'{acc:.4f}' for acc in fold_loc_accuracies]}")
+    print(f"Fold Location Accuracy (Mean ± Std): {fold_loc_acc_mean:.4f} ± {fold_loc_acc_std:.4f}")
+    print(f"Pooled File Location Accuracy: {pooled_loc_accuracy:.4f} ({total_loc_correct}/{total_loc_files} correct)")
+    print(f"Pooled 95% Wilson Score CI (Location): [{ci_loc_low:.4f}, {ci_loc_high:.4f}]")
     print("==================================================")
 
     # Save outputs
-    report = write_classification_report(
-        y_true_array,
-        y_pred_array,
+    device_report = write_classification_report(
+        y_dev_true_array,
+        y_dev_pred_array,
         CLASSES,
-        args.output_dir / f"{args.mode}_{args.pooling}_classification_report.txt",
+        args.output_dir / f"{args.mode}_{args.pooling}_device_classification_report.txt",
     )
     save_confusion_matrix_plot(
-        y_true_array,
-        y_pred_array,
+        y_dev_true_array,
+        y_dev_pred_array,
         CLASSES,
-        args.output_dir / f"{args.mode}_{args.pooling}_confusion_matrix.png",
+        args.output_dir / f"{args.mode}_{args.pooling}_device_confusion_matrix.png",
     )
+
+    location_report = write_classification_report(
+        y_loc_true_array,
+        y_loc_pred_array,
+        locations,
+        args.output_dir / f"{args.mode}_{args.pooling}_location_classification_report.txt",
+    )
+    save_confusion_matrix_plot(
+        y_loc_true_array,
+        y_loc_pred_array,
+        locations,
+        args.output_dir / f"{args.mode}_{args.pooling}_location_confusion_matrix.png",
+    )
+
     write_file_predictions(
         all_predictions_rows,
         args.output_dir / f"{args.mode}_{args.pooling}_predictions.csv",
@@ -253,17 +343,27 @@ def main() -> None:
     metrics = {
         "mode": args.mode,
         "pooling": args.pooling,
+        "aggregation": args.aggregation,
+        "top_fraction": float(args.top_fraction),
         "epochs": args.epochs,
         "folds": len(folds),
-        "fold_accuracies": fold_accuracies,
-        "mean_fold_accuracy": fold_acc_mean,
-        "std_fold_accuracy": fold_acc_std,
-        "pooled_accuracy": pooled_accuracy,
-        "total_files": total_files,
-        "total_correct": total_correct,
-        "pooled_ci_95_wilson": {
-            "low": ci_low,
-            "high": ci_high,
+        "mean_fold_device_accuracy": fold_dev_acc_mean,
+        "std_fold_device_accuracy": fold_dev_acc_std,
+        "pooled_device_accuracy": pooled_dev_accuracy,
+        "total_device_files": total_dev_files,
+        "total_device_correct": total_dev_correct,
+        "pooled_device_ci_95_wilson": {
+            "low": ci_dev_low,
+            "high": ci_dev_high,
+        },
+        "mean_fold_location_accuracy": fold_loc_acc_mean,
+        "std_fold_location_accuracy": fold_loc_acc_std,
+        "pooled_location_accuracy": pooled_loc_accuracy,
+        "total_location_files": total_loc_files,
+        "total_location_correct": total_loc_correct,
+        "pooled_location_ci_95_wilson": {
+            "low": ci_loc_low,
+            "high": ci_loc_high,
         },
     }
 

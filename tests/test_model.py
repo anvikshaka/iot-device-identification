@@ -3,7 +3,7 @@ import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from config import NUM_CLASSES
+from config import NUM_CLASSES, NUM_LOCATIONS
 from model import build_cnn
 
 
@@ -12,9 +12,11 @@ def test_build_cnn_default_pooling():
     model = build_cnn(input_shape, NUM_CLASSES)  # should default to "avg"
 
     assert model is not None
-    assert model.output_shape == (None, NUM_CLASSES)
-    assert model.loss == "categorical_crossentropy"
-    assert model.layers[-1].activation.__name__ == "softmax"
+    # Multi-output model: two output tensors [device, location]
+    assert isinstance(model.output_shape, list)
+    assert len(model.output_shape) == 2
+    assert model.output_shape[0] == (None, NUM_CLASSES)
+    assert model.output_shape[1] == (None, NUM_LOCATIONS)
     
     # Assert that the pooling layer is GlobalAveragePooling2D
     pooling_layers = [l for l in model.layers if "global_average_pooling" in l.name]
@@ -28,10 +30,11 @@ def test_build_cnn_pooling_modes():
     model_avgmax = build_cnn(input_shape, NUM_CLASSES, pooling="avgmax")
     model_flat = build_cnn(input_shape, NUM_CLASSES, pooling="flatten")
 
-    assert model_avg.output_shape == (None, NUM_CLASSES)
-    assert model_max.output_shape == (None, NUM_CLASSES)
-    assert model_avgmax.output_shape == (None, NUM_CLASSES)
-    assert model_flat.output_shape == (None, NUM_CLASSES)
+    for model in [model_avg, model_max, model_avgmax, model_flat]:
+        assert isinstance(model.output_shape, list)
+        assert len(model.output_shape) == 2
+        assert model.output_shape[0] == (None, NUM_CLASSES)
+        assert model.output_shape[1] == (None, NUM_LOCATIONS)
 
     # Check for respective pooling layers
     assert any("global_average_pooling" in l.name for l in model_avg.layers)
@@ -43,7 +46,17 @@ def test_build_cnn_pooling_modes():
     params_avg = model_avg.count_params()
     params_flat = model_flat.count_params()
 
-    # The flat model should have ~15 million parameters, avg should have ~450k
+    # The flat model should have significantly more parameters than the avg model
     assert params_flat > 14_000_000
     assert params_avg < 500_000
     assert params_flat > params_avg * 30
+
+
+def test_build_cnn_output_heads_named_correctly():
+    input_shape = (257, 61, 1)
+    model = build_cnn(input_shape, NUM_CLASSES)
+
+    # Check that the model has named output layers "device" and "location"
+    layer_names = [l.name for l in model.layers]
+    assert "device" in layer_names
+    assert "location" in layer_names
